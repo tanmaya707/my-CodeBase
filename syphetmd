@@ -1,0 +1,1075 @@
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+import { Grid, Button, Box, Typography, Alert } from "@mui/material";
+import SidebarDashbaord from '@/components/partials/sidebarDashboard/SidebarDashboard';
+import { saveTranscriptionRequest } from '@/redux/slices/transcriptSlice';
+import { useDispatch, useSelector } from "react-redux";
+import { AppDispatch, RootState } from "@/redux/store";
+import { getProfileRequest } from "@/redux/slices/authSlice";
+import ReactMarkdown from 'react-markdown';
+import Image from 'next/image';
+import { IMAGE } from '@/utils/ThemeImage';
+import "./recorder.css"
+import styles from "./recorder.module.css";
+import toast from 'react-hot-toast';
+import { fetchPlansRequest, fetchCurrentPlanRequest } from "@/redux/slices/planSlice";
+import { useRouter, usePathname } from "next/navigation";
+import CloseFullscreenIcon from '@mui/icons-material/CloseFullscreen';
+import { Minimize2, Mic, Square, Pause, Play, X, AlertCircle, Send, MicOff, Loader2, Edit, Delete } from 'lucide-react';
+
+interface TranscriptLine {
+    text: string;
+    time: string;
+    speaker: string;
+    final: boolean;
+}
+interface Transcription {
+    id: string;
+    userId: string,
+    audioUrl: string,
+    date: string;
+    duration: string;
+    transcript: TranscriptLine[];
+}
+
+export default function Dashboard() {
+    const dispatch = useDispatch<AppDispatch>();
+    const router = useRouter();
+    const socketRef = useRef<WebSocket | null>(null);
+    const processorRef = useRef<ScriptProcessorNode | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+    const timerRef = useRef<any>(null);
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const audioChunksRef = useRef<Blob[]>([]);
+    const startTimeRef = useRef<number | null>(null);
+    const totalElapsedRef = useRef<number>(0); // milliseconds
+    const [duration, setDuration] = useState(0);
+    const [isRecording, setIsRecording] = useState(false);
+    const [isPaused, setIsPaused] = useState(false);
+    const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
+    const [status, setStatus] = useState("");
+    const [summaryGpt, setSummaryGpt] = useState("");
+    const [chatSessionId, setChatSessionId] = useState<string | null>(null); // Tracks current chat ID
+    const [chatTitle, setChatTitle] = useState<string>("Untitled Chat");
+    const [relatedSearches, setRelatedSearches] = useState<string[]>([]);
+    const [message, setMessage] = useState('');
+    const [currentTranscript, setCurrentTranscript] = useState<TranscriptLine[]>([]);
+    const [is2ndRecording, setIs2ndRecording] = useState(false);
+    const [is2ndLoading, setIs2ndLoading] = useState(false);
+    const [isPlanLoading, setIsPlanLoading] = useState(true); // New state for plan loading
+
+    const speechStartRef = useRef<number | null>(null);
+    const lastSpeechRef = useRef<number | null>(null);
+    const SILENCE_GAP_MS = 3000; // 3 seconds
+
+    const [editingIndex, setEditingIndex] = useState<number | null>(null);
+    const [editingText, setEditingText] = useState("");
+    const handleEdit = (index: number, text: string) => {
+        setEditingIndex(index);
+        setEditingText(text);
+    };
+
+    const handleSave = (index: number) => {
+        const trimmedText = editingText.trim();
+        if (!trimmedText) {
+            toast.error("Transcript line cannot be empty", {
+                duration: 3000,
+                position: "top-center",
+                style: {
+                    border: "1px solid #ef4444",
+                    padding: "16px",
+                    color: "#ef4444",
+                },
+                iconTheme: {
+                    primary: "#ef4444",
+                    secondary: "#fff",
+                },
+            });
+            return; // ← don't save, don't exit edit mode
+        }
+        setTranscript(prev =>
+            prev.map((line, i) =>
+                i === index ? { ...line, text: editingText } : line
+            )
+        );
+        setEditingIndex(null);
+        setEditingText("");
+        toast.success("Line updated", { duration: 2000 });
+    };
+
+    const handleCancel = () => {
+        setEditingIndex(null);
+        setEditingText("");
+    };
+
+    const handleDelete = (index: number) => {
+        setTranscript(prev => prev.filter((_, i) => i !== index));
+    };
+    ////////////////////////////////////////////////////////
+
+    const { isAuthenticated, user, loading, error, action_status } = useSelector((state: RootState) => state.auth);
+    const userData = user?.result?.userResponse;
+
+    const { currentPlan, plans } = useSelector((state: RootState) => state.planss);
+
+    useEffect(() => {
+        if (isAuthenticated) {
+            setIsPlanLoading(true); // Start loading when fetching plan
+            dispatch(fetchCurrentPlanRequest());
+        }
+    }, [isAuthenticated, dispatch]);
+
+    // Track when currentPlan is loaded
+    useEffect(() => {
+        if (currentPlan !== null) {
+            setIsPlanLoading(false); // Plan data received
+        }
+    }, [currentPlan]);
+
+    const subscriptionStatus = currentPlan?.status;
+    const isTrialing = subscriptionStatus === "trialing";
+    const isActive = subscriptionStatus === "active";
+    
+    // Check if user has active plan (either trialing or active)
+    const hasActivePlan = isTrialing || isActive;
+
+    /*************************************************************************/
+    const [isInPip, setIsInPip] = useState(false);
+    const [pipWindow, setPipWindow] = useState<PictureInPictureWindow | null>(null);
+    const [supported, setSupported] = useState(false);
+    /**************************************************************************/
+
+    const startSpeechTimer = () => {
+        if (timerRef.current) return;
+
+        timerRef.current = setInterval(() => {
+            if (!speechStartRef.current) return;
+
+            const elapsed = Date.now() - speechStartRef.current;
+            setDuration(Math.floor(elapsed / 1000));
+        }, 500);
+    };
+
+    // ================= START =================
+    const startRecording = async () => {
+        setTranscript([]);
+        setIsRecording(true);
+        setStatus("Listening...");
+
+        //////////////////////////////
+
+        const tokenRes = await fetch("/api/internal/assembly-token");
+        const { token } = await tokenRes.json();
+
+        const socket = new WebSocket(
+            `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&token=${token}`
+        );
+        socketRef.current = socket;
+
+        totalElapsedRef.current = 0;
+        startTimeRef.current = Date.now();
+
+        setDuration(0);
+
+        timerRef.current = setInterval(() => {
+            const now = Date.now();
+            const elapsed =
+                totalElapsedRef.current + (now - (startTimeRef.current ?? now));
+
+            setDuration(Math.floor(elapsed / 1000));
+        }, 800);
+
+        socket.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (!msg.transcript || !msg.end_of_turn) return;
+
+            const now = Date.now();
+
+            // Start timer only on first speech
+            if (!speechStartRef.current) {
+                speechStartRef.current = now;
+                startSpeechTimer();
+            }
+
+            const isNewLine =
+                !lastSpeechRef.current ||
+                now - lastSpeechRef.current > SILENCE_GAP_MS;
+
+            lastSpeechRef.current = now;
+
+            setTranscript(prev => {
+                // SAME LINE (merge text)
+                if (!isNewLine && prev.length > 0) {
+                    const updated = [...prev];
+                    updated[updated.length - 1] = {
+                        ...updated[updated.length - 1],
+                        text:
+                            updated[updated.length - 1].text +
+                            " " +
+                            msg.transcript.trim(),
+                    };
+                    return updated;
+                }
+
+                // NEW LINE (after 3 sec silence)
+                return [
+                    ...prev,
+                    {
+                        // audio_file:"",
+                        text: msg.transcript.trim(),
+                        time: getCurrentTimestamp(),
+                        speaker: "Live",
+                        final: true,
+                    },
+                ];
+            });
+        };
+
+        socket.onopen = async () => {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            streamRef.current = stream;
+
+            // 🎙️ RECORD AUDIO
+            const recorder = new MediaRecorder(stream);
+            mediaRecorderRef.current = recorder;
+            audioChunksRef.current = [];
+
+            recorder.ondataavailable = e => {
+                if (e.data.size > 0) audioChunksRef.current.push(e.data);
+            };
+            recorder.start();
+
+            // 🎧 STREAM AUDIO
+            const audioContext = new AudioContext({ sampleRate: 16000 });
+            audioContextRef.current = audioContext;
+
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processorRef.current = processor;
+
+            processor.onaudioprocess = (e) => {
+                if (!socketRef.current || socketRef.current.readyState !== 1) return;
+
+                const input = e.inputBuffer.getChannelData(0);
+                const pcm16 = new Int16Array(input.length);
+
+                for (let i = 0; i < input.length; i++) {
+                    pcm16[i] = Math.max(-1, Math.min(1, input[i])) * 32767;
+                }
+
+                socketRef.current.send(pcm16.buffer);
+            };
+
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+        };
+    };
+
+    const pauseRecording = () => {
+        if (!isRecording || isPaused || !startTimeRef.current) return;
+
+        totalElapsedRef.current += Date.now() - startTimeRef.current;
+        startTimeRef.current = null;
+
+        clearInterval(timerRef.current);
+        processorRef.current?.disconnect();
+
+        setIsPaused(true);
+    };
+
+    const resumeRecording = () => {
+        if (!isRecording || !isPaused) return;
+
+        startTimeRef.current = Date.now();
+
+        timerRef.current = setInterval(() => {
+            const now = Date.now();
+            const elapsed =
+                totalElapsedRef.current + (now - (startTimeRef.current ?? now));
+
+            setDuration(Math.floor(elapsed / 1000));
+        }, 500);
+
+        if (audioContextRef.current && processorRef.current) {
+            const source =
+                audioContextRef.current.createMediaStreamSource(streamRef.current!);
+            source.connect(processorRef.current);
+            processorRef.current.connect(audioContextRef.current.destination);
+        }
+
+        setIsPaused(false);
+    };
+
+    const closeRecording = () => {
+        clearInterval(timerRef.current);
+        setIsRecording(false);
+        setIsPaused(false);
+
+        socketRef.current?.close();
+        processorRef.current?.disconnect();
+        audioContextRef.current?.close();
+        streamRef.current?.getTracks().forEach(t => t.stop());
+
+        setTranscript([]);
+    };
+
+    const formatTime = (seconds: number) => {
+        const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
+        const secs = (seconds % 60).toString().padStart(2, '0');
+        return `${mins}:${secs}`;
+    };
+
+    const getCurrentTimestamp = () => {
+        const elapsed =
+            totalElapsedRef.current +
+            (startTimeRef.current ? Date.now() - startTimeRef.current : 0);
+
+        return formatTime(Math.floor(elapsed / 1000));
+    };
+
+    // ================= STOP =================
+    const stopRecording = async () => {
+        setIsRecording(false);
+        setStatus("Processing speakers...");
+
+        if (startTimeRef.current) {
+            totalElapsedRef.current += Date.now() - startTimeRef.current;
+        }
+
+        startTimeRef.current = null;
+
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+
+        speechStartRef.current = null;
+        lastSpeechRef.current = null;
+
+        setDuration(Math.floor(totalElapsedRef.current / 1000));
+
+        socketRef.current?.send(JSON.stringify({ terminate_session: true }));
+        socketRef.current?.close();
+
+        processorRef.current?.disconnect();
+        audioContextRef.current?.close();
+        streamRef.current?.getTracks().forEach(t => t.stop());
+
+        mediaRecorderRef.current?.stop();
+
+        mediaRecorderRef.current!.onstop = async () => {
+            const audioBlob = new Blob(audioChunksRef.current, {
+                type: "audio/webm",
+            });
+
+            const formData = new FormData();
+            formData.append("audio_file", audioBlob, "recording.webm");
+
+            // Uploads audio first
+            const uploadRes = await fetch("/api/internal/upload-audio", {
+                method: "POST",
+                body: formData,
+            });
+
+            const uploadData = await uploadRes.json();
+            const uploadedAudioUrl = uploadData.audio_url;
+
+            // setTranscript(
+            //     uploadedAudioUrl.utterances.map((u: any) => ({
+            //         speaker: `Person ${u.speaker}`,
+            //         text: u.text,
+            //     }))
+            // );
+
+            const newTranscription: Transcription = {
+                id: Date.now().toString(),
+                userId: userData._id.toString(),
+                audioUrl: uploadedAudioUrl,
+                date: new Date().toLocaleDateString('en-US', { 
+                    month: 'short', 
+                    day: 'numeric', 
+                    year: 'numeric',
+                    timeZone: 'America/New_York'  // EST/EDT
+                }),
+                duration: formatTime(duration),
+                transcript: transcript
+            };
+
+            console.log(newTranscription, "save 1")
+            dispatch(saveTranscriptionRequest(newTranscription));
+        };
+
+        ////////////////////////////////////////////////////////////////
+        // if (transcript.length > 0) {
+        //     // Call your actual backend API for AI response
+        //     const response = await fetch("/api/summarize", {
+        //         method: "POST",
+        //         headers: { "Content-Type": "application/json" },
+        //         body: JSON.stringify({
+        //             diarization: "Identification",
+        //             transcript: userMessage ?? message
+        //         }),
+        //     });
+
+        //     if (!response.ok) throw new Error("Failed to get AI response");
+
+        //     const data = await response.json();
+        //     let aiResponse = data.response || data.summary || "No response received.";
+        // }
+        ////////////////////////////////////////////////////////////////
+        setStatus("Completed");
+
+        setIsRecording(false);
+        setIsPaused(false);
+        setDuration(0);
+        closePip();
+    };
+
+    /*************************************************************************/
+    useEffect(() => {
+        // Check support
+        if ("documentPictureInPicture" in window) {
+            setSupported(true);
+        }
+
+        // Listen for enter/leave events
+        const handleEnter = (event: any) => {
+            setIsInPip(true);
+            setPipWindow(event.window);
+        };
+        const handleLeave = () => {
+            setIsInPip(false);
+            setPipWindow(null);
+        };
+
+        window.addEventListener("enterpictureinpicture", handleEnter as EventListener);
+        window.addEventListener("leavepictureinpicture", handleLeave as EventListener);
+
+        return () => {
+            window.removeEventListener("enterpictureinpicture", handleEnter as EventListener);
+            window.removeEventListener("leavepictureinpicture", handleLeave as EventListener);
+        };
+    }, []);
+    const renderRecorderMarkup = () => `
+  <div id="pip-recorder">
+    <div class="mic">
+      <div class="mic-dot"></div>
+      <span id="pip-timer">00:00</span>
+    </div>
+
+    <div class="wave"></div>
+
+    <div class="controls">
+      <button data-action="cancel">✖</button>
+      <button data-action="pause">⏸</button>
+      <button data-action="stop">✔</button>
+    </div>
+  </div>
+`;
+    const closePip = () => {
+        if (pipWindow) {
+            (pipWindow as any).close();
+        }
+        setPipWindow(null);
+        setIsInPip(false);
+    };
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            if (event.origin !== window.location.origin) return;
+
+            if (event.data?.type === "PIP_ACTION") {
+                switch (event.data.action) {
+                    case "pause":
+                        if (!isPaused) {
+                            pauseRecording();
+                        } else {
+                            resumeRecording();
+                        }
+                        break;
+                    case "stop":
+                        stopRecording();
+                        closePip();
+                        break;
+                    case "cancel":
+                        closeRecording();
+                        closePip();
+                        break;
+                }
+            }
+        };
+
+        window.addEventListener("message", handler);
+        return () => window.removeEventListener("message", handler);
+    }, [isPaused, duration]);
+    useEffect(() => {
+        if (!pipWindow) return;
+
+        const timerEl = (pipWindow as any)?.document?.getElementById("pip-timer");
+        if (timerEl) {
+            timerEl.textContent = formatTime(duration);
+        }
+    }, [duration, pipWindow]);
+    useEffect(() => {
+        if (!pipWindow) return;
+
+        const btn = (pipWindow as any)?.document?.querySelector('[data-action="pause"]');
+        if (btn) {
+            btn.textContent = isPaused ? "▶" : "⏸";
+        }
+    }, [isPaused, pipWindow]);
+
+    const togglePip = async () => {
+        if (!supported) return;
+
+        const docPip = (window as any).documentPictureInPicture;
+
+        try {
+            const pip = await docPip.requestWindow({
+                width: 520,
+                height: 56,
+            });
+
+            pip.document.body.style.margin = "0";
+            pip.document.body.style.padding = "0";
+            pip.document.body.style.overflow = "hidden";
+
+            const style = pip.document.createElement("style");
+            style.textContent = `
+      html, body {
+        width: 100%;
+        height: 56px;
+        overflow: hidden;
+        background: #0f172a;
+        font-family: system-ui;
+      }
+
+      #pip-recorder {
+        display: flex;
+        align-items: center;
+        height: 56px;
+        padding: 0 12px;
+        gap: 12px;
+        color: white;
+      }
+
+      .mic {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .mic-dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: red;
+        animation: pulse 1.2s infinite;
+      }
+
+      @keyframes pulse {
+        0% { opacity: .4 }
+        50% { opacity: 1 }
+        100% { opacity: .4 }
+      }
+
+      .wave {
+        flex: 1;
+        height: 18px;
+        background: linear-gradient(90deg, #60a5fa 30%, transparent 30%);
+        background-size: 6px 100%;
+        opacity: 0.6;
+      }
+
+      .controls {
+        display: flex;
+        gap: 8px;
+      }
+
+      .controls button {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: none;
+        cursor: pointer;
+        background: #334155;
+        color: white;
+      }
+    `;
+            pip.document.head.appendChild(style);
+
+            pip.document.body.innerHTML = renderRecorderMarkup();
+
+            // BUTTON EVENTS → MAIN APP
+            pip.document.body.addEventListener("click", (e: any) => {
+                const action = e.target?.getAttribute("data-action");
+                if (!action) return;
+
+                window.postMessage(
+                    { type: "PIP_ACTION", action },
+                    window.location.origin
+                );
+            });
+
+            setPipWindow(pip);
+            setIsInPip(true);
+
+        } catch (err) {
+            console.error("PiP failed:", err);
+        }
+    };
+
+    /****************************************************************/
+    function LoaderSpinner() {
+        return (
+            <div className="flex justify-center items-center py-12">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-cyan-500"></div>
+            </div>
+        );
+    }
+
+    const generateChatId = () => {
+        return `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+    };
+
+    const handleSend = async () => {
+        if (!message.trim() || is2ndLoading) return;
+
+        const userMessage = message.trim();
+        setMessage('');
+        setIs2ndLoading(true);
+
+        // Call your actual backend API for AI response
+        const response = await fetch("/api/internal/summarize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                transcript: userMessage ?? message
+            }),
+        });
+
+        if (!response.ok) throw new Error("Failed to get AI response");
+
+        const data = await response.json();
+        let aiResponse = data.response || data.summary || "No response received.";
+        const relatedSearches = data?.related_searches || [];
+
+        setRelatedSearches(relatedSearches);
+        try {
+            let activeChatId = chatSessionId;
+            let activeChatTitle = chatTitle;
+
+            /* -------------------------------
+               CREATE CHAT ID & TITLE (ONCE)
+            -------------------------------- */
+            if (!activeChatId) {
+                activeChatId = generateChatId();
+
+                const cleanQuestion = userMessage
+                    .toLowerCase()
+                    .replace(/^(what is|what are|how to|how does|explain|tell me about|summarize)\s+/i, '')
+                    .replace(/[^\w\s]/g, '')
+                    .trim();
+
+                const words = cleanQuestion.split(' ').filter(word => word.length > 2);
+                activeChatTitle =
+                    words.slice(0, 8)
+                        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+                        .join(' ') || 'New Chat';
+
+                setChatSessionId(activeChatId);
+                setChatTitle(activeChatTitle);
+            }
+
+            /* -------------------------------
+               PREPARE TRANSCRIPT LINES
+            -------------------------------- */
+            const currentTime = new Date();
+
+            const newUserLine: TranscriptLine = {
+                text: userMessage,
+                time: currentTime.toLocaleTimeString('en-US', {
+                    minute: '2-digit',
+                    second: '2-digit',
+                }),
+                speaker: 'User',
+                final: true,
+            };
+
+            const newAiLine: TranscriptLine = {
+                text: aiResponse,
+                time: currentTime.toLocaleTimeString('en-US', {
+                    minute: '2-digit',
+                    second: '2-digit',
+                }),
+                speaker: 'AI',
+                final: true,
+            };
+
+            /* -------------------------------
+               UPDATE CHAT UI (LOCAL)
+            -------------------------------- */
+            const newBlock = `**Question:** ${userMessage}\n\n${aiResponse}`;
+            setSummaryGpt(prev =>
+                prev ? `${prev}\n\n---\n\n${newBlock}` : newBlock
+            );
+
+            /* -------------------------------
+               BUILD PAYLOAD (SAME CHAT ID)
+            -------------------------------- */
+            const transcriptionPayload = {
+                id: activeChatId,
+                title: activeChatTitle,
+                userId: userData._id.toString(),
+                date: currentTime.toLocaleDateString('en-US', {
+                    month: 'short',
+                    day: 'numeric',
+                    year: 'numeric',
+                    timeZone: 'America/New_York'  // Add EST timezone
+                }),
+                time: currentTime.toLocaleTimeString('en-US', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    timeZone: 'America/New_York'  // Add EST timezone
+                }),
+                type: 'chat',
+                duration: 'Chat',
+                transcript: [
+                    ...currentTranscript,
+                    newUserLine,
+                    newAiLine,
+                ],
+                summary: aiResponse,
+            };
+
+             console.log(transcriptionPayload, "save 2")
+
+            /* -------------------------------
+            SAVE / UPDATE CHAT
+            -------------------------------- */
+            dispatch(saveTranscriptionRequest(transcriptionPayload));
+
+            /* -------------------------------
+               UPDATE LOCAL TRANSCRIPT STATE
+            -------------------------------- */
+            setCurrentTranscript(prev => [...prev, newUserLine, newAiLine]);
+
+        } catch (error) {
+            console.error('Chat error:', error);
+            setSummaryGpt(prev => `${prev}\n\n**Error:** Something went wrong.`);
+        } finally {
+            setIs2ndLoading(false);
+            setTimeout(() => {
+                window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+            }, 100);
+        }
+    };
+
+    /*************************************************************************/
+    return (
+        <>
+            <Grid className="dashboardLayout" container spacing={2}
+                sx={{ flexDirection: { xs: 'column-reverse', sm: 'column-reverse', md: 'row' } }}>
+                <Grid size={{
+                    xs: 12,
+                    sm: 12,
+                    md: 4,
+                    lg: 4
+                }}>
+                    <SidebarDashbaord />
+                </Grid>
+                <Grid size={{
+                    xs: 12,
+                    sm: 12,
+                    md: 8,
+                    lg: 8
+                }}>
+                    <div className="space-y-1">
+                        {!isRecording ? (
+                            <>
+                                <div className=" bg-gray-50 flex flex-col">
+                                    {/* Main Content Area - Scrollable Messages */}
+                                    <div className="pb-5 mb-5">
+                                        {/* Main Content Area - Scrollable Messages */}
+                                        <div className="mainContentArea flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-gray-100">
+                                            <div className="max-w-4xl mx-auto w-full">
+                                                {summaryGpt ? (
+                                                    <div className="bg-white overflow-y-auto rounded-2xl border border-gray-200 p-8 shadow-sm prose prose-lg max-w-none">
+                                                        <ReactMarkdown
+                                                            remarkPlugins={[]}
+                                                            components={{
+                                                                p: ({ children }) => <p className="text-gray-800 leading-relaxed mb-2">{children}</p>,
+                                                                h1: ({ children }) => <h1 className="text-3xl font-bold text-slate-900 mt-8 mb-4">{children}</h1>,
+                                                                h2: ({ children }) => <h2 className="text-2xl font-semibold text-slate-800 mt-6 mb-3">{children}</h2>,
+                                                                ul: ({ children }) => <ul className="list-disc pl-8 space-y-2 my-6 text-gray-700">{children}</ul>,
+                                                                ol: ({ children }) => <ol className="list-decimal pl-8 space-y-2 my-6 text-gray-700">{children}</ol>,
+                                                                li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                                                                blockquote: ({ children }) => (
+                                                                    <blockquote className="border-l-4 border-blue-500 pl-6 italic text-gray-600 my-8">{children}</blockquote>
+                                                                ),
+                                                            }}
+                                                        >
+                                                            {summaryGpt}
+                                                        </ReactMarkdown>
+
+                                                        {relatedSearches.length > 0 && (
+                                                            <div className="mt-4 flex flex-wrap gap-2">
+                                                                {relatedSearches.map((item, index) => (
+                                                                    <button
+                                                                        type='button'
+                                                                        key={index}
+                                                                        onClick={() => setMessage(item)}
+                                                                        className="px-4 py-2 text-sm rounded-full bg-gray-100 hover:bg-blue-100 text-blue-700 transition"
+                                                                    >
+                                                                        {item}
+                                                                    </button>
+                                                                ))}
+                                                            </div>
+                                                        )}
+
+                                                    </div>
+                                                ) : (
+                                                    /* Welcome / Empty State */
+                                                    <div className=" flex flex-col items-center justify-center text-center py-10">
+                                                        <h1 className="geet">
+                                                            Hello, <span className="font-semibold text-slate-800">{userData?.first_name || 'there'}</span>
+                                                        </h1>
+                                                        <h2 className="startConvo">
+                                                            Start a conversation or use voice to transcribe
+                                                        </h2>
+
+                                                        {/* Pulsing Animation */}
+                                                        <div className="relative w-60 h-60 mb-12">
+                                                            <div className="absolute inset-0 rounded-full border-4 border-blue-200/50 animate-ping-slow"></div>
+                                                            <div className="absolute inset-6 rounded-full border-4 border-cyan-300/40 animate-ping-slow delay-300"></div>
+                                                            <div className="absolute inset-12 rounded-full border-4 border-blue-400/50 animate-ping-slow delay-600"></div>
+                                                            <div className="absolute inset-20 rounded-full border-4 border-cyan-500/60 animate-ping-slow delay-1000"></div>
+
+                                                            <div className="absolute inset-0 flex items-center justify-center">
+                                                                <div className="w-13 h-13 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-full flex items-center justify-center shadow-2xl animate-pulse">
+                                                                    <Mic className="w-7 h-7 text-white" />
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {/* Proper loading and plan checking logic */}
+                                                        {isPlanLoading ? (
+                                                            <LoaderSpinner />
+                                                        ) : (
+                                                            <>
+                                                                {hasActivePlan ? (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={startRecording}
+                                                                        className="themeButtonBgNone"
+                                                                    >
+                                                                        <Image className='bannerVdoImage' src={IMAGE.playButtonn} alt="Play" />
+                                                                        Start Recording
+                                                                    </button>
+                                                                ) : (
+                                                                    <div className="text-center">
+                                                                        <p className='mb-1'>You need an active plan to start recording.</p>
+                                                                        <button
+                                                                            type='button'
+                                                                            onClick={() => router.push('/subscriptions')}
+                                                                            className="themeButton"
+                                                                        >
+                                                                            View Plans
+                                                                        </button>
+                                                                    </div>
+                                                                )}
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </>
+                        ) : (
+                            <div className="flex items-center justify-center bg-gray-50 md:p-4 p-3">
+                                <div className="w-full max-w-4xl bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+                                    <div>
+                                        <section className={styles.recorder} aria-label="Audio recorder">
+                                            {/* Left cluster: mic + timer */}
+                                            <div className={styles.mic}>
+                                                <button type='button' className={styles.micBtn} aria-label="Start recording">
+                                                    <svg className={styles.micIcon} viewBox="0 0 24 24" aria-hidden="true">
+                                                        <path fill="#fff"
+                                                            d="M12 14a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v4a4 4 0 0 0 4 4zm6-4a6 6 0 0 1-12 0H4a8 8 0 0 0 7 7.93V22h2v-4.07A8 8 0 0 0 20 10h-2z" />
+                                                    </svg>
+                                                </button>
+                                                <div className={styles.timer} aria-live="polite">
+                                                    {formatTime(duration)}
+                                                </div>
+                                            </div>
+
+                                            {/* Middle: waveform */}
+                                            <div className={`${styles.wave} ${isPaused ? styles.wavePaused : ""}`} aria-hidden="true">
+                                                {Array.from({ length: 30 }).map((_, i) => (
+                                                    <div className={styles.bar} key={i} />
+                                                ))}
+                                            </div>
+
+                                            {/* Right: controls */}
+                                            <div className={styles.controls} role="group" aria-label="Recording controls">
+                                                <button type='button' className={`${styles.ctrlBtn} ${styles.ghost}`} aria-label="Discard recording" onClick={closeRecording}>
+                                                    {/* X icon */}
+                                                    <svg className={styles.icon} viewBox="0 0 24 24" fill="none" strokeWidth="2.5" strokeLinecap="round"
+                                                        aria-hidden="true">
+                                                        <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" />
+                                                    </svg>
+                                                </button>
+
+                                                <button type='button' className={`${styles.ctrlBtn} ${styles.primary}`} aria-label={isPaused ? "Resume recording"
+                                                    : "Pause recording"} onClick={!isPaused ? pauseRecording : resumeRecording}
+                                                >
+                                                    {isPaused ? (
+                                                        // Play icon
+                                                        <svg className={styles.icon} viewBox="0 0 24 24" aria-hidden="true">
+                                                            <path d="M8 5l12 7-12 7V5z" fill="#ffffff" />
+                                                        </svg>
+                                                    ) : (
+                                                        // Pause icon
+                                                        <svg className={styles.icon} viewBox="0 0 24 24" aria-hidden="true">
+                                                            <rect x="6" y="4" width="4.5" height="16" rx="4" ry="4" fill="#ffffff" />
+                                                            <rect x="13.5" y="4" width="4.5" height="16" rx="4" ry="4" fill="#ffffff" />
+                                                        </svg>
+                                                    )}
+                                                </button>
+
+                                                <button type='button' className={`${styles.ctrlBtn} ${styles.ghost}`} aria-label="Save recording" onClick={stopRecording}>
+                                                    <svg className={styles.icon} viewBox="0 0 24 24" fill="none" strokeWidth="2.5" strokeLinecap="round"
+                                                        aria-hidden="true">
+                                                        <path d="M5 13l4 4L19 7" stroke="currentColor" />
+                                                    </svg>
+                                                </button>
+                                            </div>
+                                        </section>
+                                    </div>
+                                    {/* Live Transcript */}
+                                    {transcript.length > 0 && (
+                                        <>
+                                            <header className="flex items-center justify-between md:p-6 p-3 border-b border-gray-200 bg-white/95">
+                                                {/* <h2 className="text-slate-700 text-xl font-semibold">Transcrit</h2> */}
+                                                <h3 className="text-lg font-semibold text-gray-700 flex items-center gap-md-3 gap-2">
+                                                    <div className={`w-3 h-3 ${isRecording && !isPaused ? 'bg-red-500' : 'bg-gray-400'} rounded-full animate-pulse`}></div>
+                                                    Live Transcript {isPaused && '(Paused)'}
+                                                </h3>
+                                                {isRecording && supported ? (
+                                                    <button
+                                                        type='button'
+                                                        onClick={togglePip}
+                                                        className="p-2 text-gray-400 hover:text-gray-600 transition-colors rounded-lg hover:bg-gray-100"
+                                                        aria-label="Minimize conversation"
+                                                    >
+                                                        {/* <Minimize2 className="w-5 h-5" /> */}
+                                                        {isInPip ? <CloseFullscreenIcon /> : <CloseFullscreenIcon />}
+                                                    </button>
+                                                ) : (
+                                                    // <Alert severity="warning" sx={{ mt: 3 }}>
+                                                    //     Your browser does not support Document Picture-in-Picture.
+                                                    //     Try the latest Chrome or Edge.
+                                                    // </Alert>
+                                                    <></>
+                                                )}
+
+                                            </header>
+                                            <div className="md:p-6 p-3 space-y-4 max-h-96 overflow-y-auto">
+                                                {transcript.map((line, i) => (
+                                                    <div key={i} className="flex flex-md-nowrap flex-wrap items-center md:gap-3 gap-2 group">
+                                                        {/* Left color bar */}
+                                                        <div
+                                                            className={`w-1 h-full min-h-[20px] rounded-full flex-shrink-0 ${
+                                                                // line.speaker === "Doctor" ? "bg-blue-500" : "bg-green-500"
+                                                                i % 2 === 0 ? "bg-blue-500" : "bg-green-500"
+                                                                }`}
+                                                            aria-hidden="true"
+                                                        />
+
+                                                        {/* Text / Editor */}
+                                                        <div className="flex-1">
+                                                            {editingIndex === i ? (
+                                                                <>
+                                                                    <textarea
+                                                                        title='edit'
+                                                                        value={editingText}
+                                                                        onChange={(e) => setEditingText(e.target.value)}
+                                                                        className="w-full border rounded-md p-2 text-sm"
+                                                                        rows={2}
+                                                                    />
+
+                                                                    <div className="flex gap-2 mt-2">
+                                                                        <button
+                                                                            type='button'
+                                                                            title='save'
+                                                                            onClick={() => handleSave(i)}
+                                                                            className="text-xs px-3 py-1 bg-blue-600 text-white rounded"
+                                                                        >
+                                                                            Save
+                                                                        </button>
+                                                                        <button
+                                                                            type='button'
+                                                                            title='cancel'
+                                                                            onClick={handleCancel}
+                                                                            className="text-xs px-3 py-1 bg-gray-200 rounded"
+                                                                        >
+                                                                            Cancel
+                                                                        </button>
+                                                                    </div>
+                                                                </>
+                                                            ) : (
+                                                                <p className="text-gray-700 leading-relaxed text-sm md:text-base">
+                                                                    {/* <strong className="mr-1">{line.speaker}:</strong> */}
+                                                                    {line.text}
+                                                                </p>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Time */}
+                                                        <span className="text-xs text-gray-400 whitespace-nowrap">
+                                                            {line.time}
+                                                        </span>
+
+                                                        {/* Actions */}
+                                                        {editingIndex !== i && (
+                                                            <div className="flex gap-2 md:opacity-1 md:group-hover:opacity-100 transition md:w-auto w-full justify-end">
+                                                                <button
+                                                                    type='button'
+                                                                    title='edit'
+                                                                    onClick={() => handleEdit(i, line.text)}
+                                                                    className="text-xs text-blue-600 hover:underline"
+                                                                >
+                                                                    Edit
+                                                                </button>
+                                                                <button
+                                                                    type='button'
+                                                                    title='delete'
+                                                                    onClick={() => handleDelete(i)}
+                                                                    className="text-xs text-red-600 hover:underline"
+                                                                >
+                                                                    Delete
+                                                                </button>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+
+                                                {transcript.length === 0 && (
+                                                    <p className="text-center text-gray-400">No transcript available</p>
+                                                )}
+                                            </div>
+
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div >
+                </Grid>
+            </Grid >
+        </>
+    );
+}
+
+
